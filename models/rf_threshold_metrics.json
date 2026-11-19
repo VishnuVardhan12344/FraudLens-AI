@@ -1,0 +1,25 @@
+{
+  "validation_selection": {
+    "threshold": 0.35000000000000003,
+    "precision": 0.872093023255814,
+    "recall": 0.7575757575757576,
+    "f1": 0.8108108108108109,
+    "tp": 75,
+    "fp": 11,
+    "fn": 24,
+    "tn": 56852,
+    "total_alerts": 86
+  },
+  "test_metrics": {
+    "threshold": 0.35000000000000003,
+    "precision": 0.803921568627451,
+    "recall": 0.8367346938775511,
+    "f1": 0.82,
+    "tp": 82,
+    "fp": 20,
+    "fn": 16,
+    "tn": 56844,
+    "total_alerts": 102,
+    "average_precision": 0.8107424633642556
+  }
+}

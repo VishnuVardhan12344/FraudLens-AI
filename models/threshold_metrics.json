@@ -1,0 +1,25 @@
+{
+  "validation_selection": {
+    "threshold": 0.9500000000000001,
+    "precision": 0.22946175637393768,
+    "recall": 0.8181818181818182,
+    "f1": 0.3584070796460177,
+    "true_positives": 81,
+    "false_positives": 272,
+    "false_negatives": 18,
+    "true_negatives": 56591,
+    "total_alerts": 353
+  },
+  "test_metrics": {
+    "threshold": 0.9500000000000001,
+    "precision": 0.23450134770889489,
+    "recall": 0.8877551020408163,
+    "f1": 0.37100213219616207,
+    "true_positives": 87,
+    "false_positives": 284,
+    "false_negatives": 11,
+    "true_negatives": 56580,
+    "total_alerts": 371,
+    "average_precision": 0.7212670495150669
+  }
+}
