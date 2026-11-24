@@ -3,11 +3,14 @@ name: FraudLens AI CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
 
 jobs:
+
   test:
-    name: Full Python Test Suite
+    name: Python Unit Tests
     runs-on: ubuntu-latest
 
     steps:
@@ -19,21 +22,26 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install test dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements-test.txt
+          pip install -r requirements-test.txt
 
-      - name: Run all Python tests
+      - name: Run all pytest tests
         env:
           PYTHONPATH: src
+          FRAUDLENS_API_KEY: fraudlens-ci-test-key
         run: |
           python -m pytest tests/ -v
 
   docker:
-    name: Docker Build and Smoke Tests
+    name: Authenticated Docker Smoke Tests
     runs-on: ubuntu-latest
     needs: test
+
+    env:
+      FRAUDLENS_API_KEY: fraudlens-ci-test-key
+      FRAUDLENS_API_URL: http://127.0.0.1:8001
 
     steps:
       - name: Checkout repository
@@ -44,26 +52,27 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install smoke-test dependency
+      - name: Install smoke test dependencies
         run: |
-          python -m pip install httpx
+          pip install httpx python-dotenv
 
       - name: Build Docker image
         run: |
           docker build -t fraudlens-ai:ci .
 
-      - name: Start Docker container
+      - name: Start secured Docker container
         run: |
           docker run -d \
             --name fraudlens-ci-test \
+            -e FRAUDLENS_API_KEY \
             -p 127.0.0.1:8001:8000 \
             fraudlens-ai:ci
 
-      - name: Run Docker smoke tests
+      - name: Run authenticated smoke tests
         run: |
           python scripts/docker_smoke_test.py
 
-      - name: Show Docker logs if a step fails
+      - name: Show Docker logs on failure
         if: failure()
         run: |
           docker logs fraudlens-ci-test || true

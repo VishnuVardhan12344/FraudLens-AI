@@ -1,0 +1,6 @@
+
+streamlit
+httpx
+pandas
+altair
+python-dotenv

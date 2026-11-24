@@ -16,3 +16,4 @@ mlflow.db
 *.log
 .env
 .env.*
+.streamlit/secrets.toml

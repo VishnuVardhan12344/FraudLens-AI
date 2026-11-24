@@ -1,84 +1,124 @@
 
 import os
-import sys
 import time
 
 import httpx
+from dotenv import load_dotenv
 
-# Docker API address
+
+load_dotenv()
+
 BASE_URL = os.getenv(
     "FRAUDLENS_API_URL",
-    "http://127.0.0.1:8001"
-)
+    "http://127.0.0.1:8001",
+).rstrip("/")
+
+API_KEY = os.getenv("FRAUDLENS_API_KEY")
+
+if not API_KEY:
+    raise RuntimeError("API key is not configured")
 
 
-def test_health():
-    print("Checking FraudLens API health...")
+# 1. Wait for the API to become ready.
 
-    # Wait up to approximately 60 seconds
+def wait_for_api():
+
     for attempt in range(30):
+
         try:
             response = httpx.get(
                 f"{BASE_URL}/health",
-                timeout=3
+                timeout=3,
             )
 
-            if response.status_code == 200:
-                data = response.json()
+            if (
+                response.status_code == 200
+                and response.json().get("status") == "ready"
+            ):
+                print("Health check passed")
+                return
 
-                if data.get("status") == "ready":
-                    print("PASS: /health")
-                    return
-
-        except (httpx.RequestError, ValueError):
+        except httpx.RequestError:
             pass
 
+        print(f"Waiting for API: attempt {attempt + 1}")
         time.sleep(2)
 
-    raise RuntimeError(
-        "FraudLens API did not become ready"
-    )
+    raise RuntimeError("API did not become ready")
 
 
-def test_prediction():
-    print("Testing fraud prediction...")
+# 2. Create a synthetic transaction.
 
-    # Synthetic transaction with 30 input fields
+def build_payload():
+
     transaction = {
         "Time": 1000.0,
-        "Amount": 120.0
+        "Amount": 120.0,
     }
 
-    for i in range(1, 29):
-        transaction[f"V{i}"] = 0.0
+    transaction.update({
+        f"V{i}": 0.0
+        for i in range(1, 29)
+    })
 
+    return {"features": transaction}
+
+
+# 3. Test API authentication.
+
+def test_authentication():
+
+    payload = build_payload()
+
+    # Missing API key
     response = httpx.post(
-    f"{BASE_URL}/predict",
-    json={"features": transaction},
-    timeout=15
+        f"{BASE_URL}/predict",
+        json=payload,
+        timeout=30,
     )
 
-    print("Status code:", response.status_code)
-    print("Response:", response.text)
+    assert response.status_code == 401
+    print("Missing API key test passed")
+
+    # Incorrect API key
+    response = httpx.post(
+        f"{BASE_URL}/predict",
+        json=payload,
+        headers={
+            "X-API-Key": "incorrect-key"
+        },
+        timeout=30,
+    )
+
+    assert response.status_code == 401
+    print("Invalid API key test passed")
+
+    # Correct API key
+    response = httpx.post(
+        f"{BASE_URL}/predict",
+        json=payload,
+        headers={
+            "X-API-Key": API_KEY
+        },
+        timeout=30,
+    )
 
     response.raise_for_status()
 
     result = response.json()
 
-    assert isinstance(result, dict), (
-        "Prediction must return a JSON object"
-    )
+    assert result["prediction"] in (0, 1)
+    assert 0 <= result["fraud_probability"] <= 1
 
-    print("PASS: /predict")
+    print("Authenticated prediction passed")
+    print(result)
 
+
+# 4. Execute all smoke tests.
 
 if __name__ == "__main__":
-    try:
-        test_health()
-        test_prediction()
 
-        print("All Docker smoke tests passed!")
+    wait_for_api()
+    test_authentication()
 
-    except Exception as error:
-        print(f"Smoke test failed: {error}")
-        sys.exit(1)
+    print("All Docker smoke tests passed")

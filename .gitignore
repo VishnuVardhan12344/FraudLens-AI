@@ -12,6 +12,10 @@ __pycache__/
 .env
 .env.*
 !.env.example
+.streamlit/secrets.toml
+
+# Local backup files
+dashboard/app_backup.py
 
 # Data and experiments
 data/

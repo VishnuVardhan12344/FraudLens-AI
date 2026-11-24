@@ -6,9 +6,51 @@ import math
 import joblib
 import numpy as np
 import pandas as pd
-
-from fastapi import FastAPI, HTTPException
+import os
+import secrets
+from dotenv import load_dotenv
+from fastapi import FastAPI, Depends, HTTPException, Security
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
+
+
+
+# -------------------------------------
+# API KEY AUTHENTICATION
+# -------------------------------------
+
+load_dotenv()
+
+api_key_header = APIKeyHeader(
+    name="X-API-Key",
+    auto_error=False,
+)
+
+
+def verify_api_key(
+    api_key: str | None = Security(api_key_header),
+):
+    expected_api_key = os.getenv(
+        "FRAUDLENS_API_KEY"
+    )
+
+    if not expected_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="API authentication is not configured",
+        )
+
+    if not api_key or not secrets.compare_digest(
+        api_key.encode("utf-8"),
+        expected_api_key.encode("utf-8"),
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid API key",
+        )
+
+    return True
+
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -172,7 +214,10 @@ def prepare_features(raw_features, saved_features):
     return frame.loc[:, saved_features]
 
 
-@app.post("/predict")
+@app.post(
+    "/predict",
+    dependencies=[Depends(verify_api_key)],
+)
 def predict(transaction: Transaction):
 
     if MODEL_BUNDLE is None:
