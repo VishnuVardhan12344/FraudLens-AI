@@ -4,4 +4,6 @@ pandas
 numpy
 scikit-learn
 joblib
+python-dotenvprometheus-client
+prometheus-client
 python-dotenv

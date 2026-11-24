@@ -1,19 +1,44 @@
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+
 import math
+import os
+import secrets
+import time
 
 import joblib
 import numpy as np
 import pandas as pd
-import os
-import secrets
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, Security
+
+from fastapi import (
+    FastAPI,
+    Depends,
+    HTTPException,
+    Security,
+    Request,
+)
+
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
 
+from fraudlens.middleware import request_monitoring_middleware
+from fraudlens.prediction_monitor import prediction_monitor
+from fraudlens.rate_limiter import enforce_rate_limit
+from fastapi import Response
 
+from prometheus_client import (
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
+
+from fraudlens.metrics import (
+    MODEL_PREDICTIONS,
+    MODEL_FAILURES,
+    MODEL_LATENCY,
+)
 
 # -------------------------------------
 # API KEY AUTHENTICATION
@@ -30,9 +55,8 @@ api_key_header = APIKeyHeader(
 def verify_api_key(
     api_key: str | None = Security(api_key_header),
 ):
-    expected_api_key = os.getenv(
-        "FRAUDLENS_API_KEY"
-    )
+
+    expected_api_key = os.getenv("FRAUDLENS_API_KEY")
 
     if not expected_api_key:
         raise HTTPException(
@@ -52,6 +76,9 @@ def verify_api_key(
     return True
 
 
+# -------------------------------------
+# MODEL CONFIGURATION
+# -------------------------------------
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -75,7 +102,12 @@ ENGINEERED_FEATURES = [
 MODEL_BUNDLE = None
 
 
+# -------------------------------------
+# TRANSACTION VALIDATION
+# -------------------------------------
+
 class Transaction(BaseModel):
+
     features: dict[str, float] = Field(
         description="Time, V1-V28, and Amount"
     )
@@ -96,7 +128,9 @@ class Transaction(BaseModel):
                 f"Unexpected features: {extra}"
             )
 
-        if not all(math.isfinite(v) for v in values.values()):
+        if not all(
+            math.isfinite(v) for v in values.values()
+        ):
             raise ValueError(
                 "All feature values must be finite"
             )
@@ -110,6 +144,10 @@ class Transaction(BaseModel):
         return values
 
 
+# -------------------------------------
+# MODEL LOADING
+# -------------------------------------
+
 def load_model():
 
     if not MODEL_PATH.exists():
@@ -117,7 +155,7 @@ def load_model():
             f"Missing trained model: {MODEL_PATH}"
         )
 
-    # Only load artifacts produced by trusted training code.
+    # Only load trusted model artifacts.
     bundle = joblib.load(MODEL_PATH)
 
     if not isinstance(bundle, dict):
@@ -160,14 +198,26 @@ def load_model():
     return bundle
 
 
+# -------------------------------------
+# APPLICATION LIFESPAN
+# -------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
     global MODEL_BUNDLE
 
     MODEL_BUNDLE = load_model()
-    yield
-    MODEL_BUNDLE = None
 
+    try:
+        yield
+    finally:
+        MODEL_BUNDLE = None
+
+
+# -------------------------------------
+# FASTAPI APPLICATION
+# -------------------------------------
 
 app = FastAPI(
     title="FraudLens AI API",
@@ -177,16 +227,30 @@ app = FastAPI(
 )
 
 
+# Request monitoring middleware
+app.middleware("http")(request_monitoring_middleware)
+
+
+# -------------------------------------
+# HOME ENDPOINT
+# -------------------------------------
+
 @app.get("/")
 def home():
+
     return {
         "message": "Welcome to FraudLens AI",
         "documentation": "/docs",
     }
 
 
+# -------------------------------------
+# HEALTH ENDPOINT
+# -------------------------------------
+
 @app.get("/health")
 def health():
+
     return {
         "status": (
             "ready" if MODEL_BUNDLE is not None
@@ -195,35 +259,57 @@ def health():
     }
 
 
+# -------------------------------------
+# FEATURE ENGINEERING
+# -------------------------------------
+
 def prepare_features(raw_features, saved_features):
 
     row = dict(raw_features)
 
     amount = row["Amount"]
-    time = row["Time"]
+    elapsed_time = row["Time"]
 
-    # Match Lesson 3 transformations.
     row["log_amount"] = math.log1p(amount)
-    row["amount_is_zero"] = int(amount == 0)
-    row["elapsed_day"] = int(time // 86400)
-    row["elapsed_hour"] = int((time % 86400) // 3600)
 
-    # Preserve the exact feature order used in training.
+    row["amount_is_zero"] = int(amount == 0)
+
+    row["elapsed_day"] = int(
+        elapsed_time // 86400
+    )
+
+    row["elapsed_hour"] = int(
+        (elapsed_time % 86400) // 3600
+    )
+
     frame = pd.DataFrame([row])
 
     return frame.loc[:, saved_features]
 
 
+#
+# -------------------------------------
+# FRAUD PREDICTION ENDPOINT
+# -------------------------------------
+
 @app.post(
     "/predict",
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[
+        Depends(verify_api_key),
+        Depends(enforce_rate_limit),
+    ],
 )
-def predict(transaction: Transaction):
+def predict(
+    transaction: Transaction,
+    request: Request,
+):
+
+    request_id = request.state.request_id
 
     if MODEL_BUNDLE is None:
         raise HTTPException(
             status_code=503,
-            detail="Model is not loaded"
+            detail="Model is not loaded",
         )
 
     model = MODEL_BUNDLE["model"]
@@ -235,26 +321,116 @@ def predict(transaction: Transaction):
         feature_names,
     )
 
-    probability = float(
-        model.predict_proba(X)[0, 1]
-    )
+    inference_start = time.perf_counter()
 
-    if not np.isfinite(probability):
+    try:
+
+        probability = float(
+            model.predict_proba(X)[0, 1]
+        )
+
+        inference_latency_ms = (
+            time.perf_counter() - inference_start
+        ) * 1000
+
+    except Exception as exc:
+
+        MODEL_FAILURES.inc()
+
+        prediction_monitor.record_failure(
+            request_id=request_id,
+            error_type=type(exc).__name__,
+        )
+
+        raise
+
+    if (
+        not np.isfinite(probability)
+        or not 0 <= probability <= 1
+    ):
+
+        MODEL_FAILURES.inc()
+
+        prediction_monitor.record_failure(
+            request_id=request_id,
+            error_type="InvalidProbability",
+        )
+
         raise HTTPException(
             status_code=500,
-            detail="Model returned invalid probability"
+            detail="Model returned invalid probability",
         )
 
     prediction = int(probability >= threshold)
+
+    label = (
+        "Fraud" if prediction == 1
+        else "Legitimate"
+    )
+
+    prediction_monitor.record_prediction(
+        probability=probability,
+        prediction=prediction,
+        latency_ms=inference_latency_ms,
+        request_id=request_id,
+    )
+
+    # Prometheus model metrics
+    MODEL_PREDICTIONS.labels(
+        label=label
+    ).inc()
+
+    MODEL_LATENCY.observe(
+        inference_latency_ms / 1000
+    )
 
     return {
         "fraud_probability": round(probability, 6),
         "threshold": round(threshold, 4),
         "prediction": prediction,
-        "label": (
-            "Fraud" if prediction == 1
-            else "Legitimate"
-        ),
+        "label": label,
         "model": "RandomForest-Optimized",
     }
 
+
+# -------------------------------------
+# ML MONITORING ENDPOINT
+# -------------------------------------
+
+@app.get(
+    "/monitoring/predictions",
+    dependencies=[Depends(verify_api_key)],
+)
+def get_prediction_metrics():
+
+    return prediction_monitor.get_metrics()
+
+
+# -------------------------------------
+# PROMETHEUS METRICS ENDPOINT
+# -------------------------------------
+
+@app.get(
+    "/metrics",
+    dependencies=[Depends(verify_api_key)],
+)
+def prometheus_metrics():
+
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
+
+
+
+# -------------------------------------
+# ML MONITORING ENDPOINT
+# -------------------------------------
+
+@app.get(
+    "/monitoring/predictions",
+    dependencies=[Depends(verify_api_key)],
+)
+def get_prediction_metrics():
+
+    return prediction_monitor.get_metrics()
