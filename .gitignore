@@ -24,3 +24,7 @@ mlflow.db
 
 # Local artifacts
 *.log
+data/monitoring/
+models/candidates/
+reports/drift_report.csv
+reports/drift_summary.json
