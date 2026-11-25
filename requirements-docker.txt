@@ -7,3 +7,5 @@ joblib
 python-dotenv
 prometheus-client
 
+sqlalchemy
+psycopg[binary]

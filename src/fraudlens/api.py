@@ -13,25 +13,41 @@ import pandas as pd
 
 from dotenv import load_dotenv
 
+load_dotenv()
+
 from fastapi import (
     FastAPI,
     Depends,
     HTTPException,
     Security,
     Request,
+    Response,
+    Query,
 )
 
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field, field_validator
 
-from fraudlens.middleware import request_monitoring_middleware
-from fraudlens.prediction_monitor import prediction_monitor
-from fraudlens.rate_limiter import enforce_rate_limit
-from fastapi import Response
+from pydantic import (
+    BaseModel,
+    Field,
+    field_validator,
+)
 
 from prometheus_client import (
     generate_latest,
     CONTENT_TYPE_LATEST,
+)
+
+from fraudlens.middleware import (
+    request_monitoring_middleware,
+)
+
+from fraudlens.prediction_monitor import (
+    prediction_monitor,
+)
+
+from fraudlens.rate_limiter import (
+    enforce_rate_limit,
 )
 
 from fraudlens.metrics import (
@@ -40,11 +56,25 @@ from fraudlens.metrics import (
     MODEL_LATENCY,
 )
 
-# -------------------------------------
-# API KEY AUTHENTICATION
-# -------------------------------------
+from fraudlens.database import (
+    initialize_database,
+)
 
-load_dotenv()
+from fraudlens.prediction_repository import (
+    save_prediction,
+    get_prediction_history,
+    get_database_summary,
+)
+
+from fraudlens.logger import get_logger
+
+
+logger = get_logger("api")
+
+
+# ------------------------------------
+# API authentication
+# ------------------------------------
 
 api_key_header = APIKeyHeader(
     name="X-API-Key",
@@ -53,10 +83,12 @@ api_key_header = APIKeyHeader(
 
 
 def verify_api_key(
-    api_key: str | None = Security(api_key_header),
+    api_key: str | None = Security(api_key_header)
 ):
 
-    expected_api_key = os.getenv("FRAUDLENS_API_KEY")
+    expected_api_key = os.getenv(
+        "FRAUDLENS_API_KEY"
+    )
 
     if not expected_api_key:
         raise HTTPException(
@@ -76,14 +108,16 @@ def verify_api_key(
     return True
 
 
-# -------------------------------------
-# MODEL CONFIGURATION
-# -------------------------------------
+# ------------------------------------
+# Model configuration
+# ------------------------------------
 
 ROOT = Path(__file__).resolve().parents[2]
 
 MODEL_PATH = (
-    ROOT / "models" / "random_forest_optimized.joblib"
+    ROOT
+    / "models"
+    / "random_forest_optimized.joblib"
 )
 
 FEATURE_NAMES = (
@@ -99,12 +133,15 @@ ENGINEERED_FEATURES = [
     "elapsed_hour",
 ]
 
+MODEL_VERSION = "RandomForest-Optimized"
+
 MODEL_BUNDLE = None
+DATABASE_READY = False
 
 
-# -------------------------------------
-# TRANSACTION VALIDATION
-# -------------------------------------
+# ------------------------------------
+# Transaction validation
+# ------------------------------------
 
 class Transaction(BaseModel):
 
@@ -129,24 +166,29 @@ class Transaction(BaseModel):
             )
 
         if not all(
-            math.isfinite(v) for v in values.values()
+            math.isfinite(v)
+            for v in values.values()
         ):
             raise ValueError(
                 "All feature values must be finite"
             )
 
         if values["Time"] < 0:
-            raise ValueError("Time cannot be negative")
+            raise ValueError(
+                "Time cannot be negative"
+            )
 
         if values["Amount"] < 0:
-            raise ValueError("Amount cannot be negative")
+            raise ValueError(
+                "Amount cannot be negative"
+            )
 
         return values
 
 
-# -------------------------------------
-# MODEL LOADING
-# -------------------------------------
+# ------------------------------------
+# Load trained model
+# ------------------------------------
 
 def load_model():
 
@@ -155,12 +197,11 @@ def load_model():
             f"Missing trained model: {MODEL_PATH}"
         )
 
-    # Only load trusted model artifacts.
     bundle = joblib.load(MODEL_PATH)
 
     if not isinstance(bundle, dict):
         raise ValueError(
-            "Expected Lesson 9 optimized model dictionary"
+            "Expected optimized model dictionary"
         )
 
     required_keys = {
@@ -179,12 +220,17 @@ def load_model():
     saved_features = list(bundle["feature_names"])
 
     if not 0 <= threshold <= 1:
-        raise ValueError("Invalid model threshold")
+        raise ValueError(
+            "Invalid model threshold"
+        )
+
+    expected_features = set(
+        FEATURE_NAMES + ENGINEERED_FEATURES
+    )
 
     if (
         len(saved_features) != len(set(saved_features))
-        or set(saved_features)
-        != set(FEATURE_NAMES + ENGINEERED_FEATURES)
+        or set(saved_features) != expected_features
     ):
         raise ValueError(
             "Saved model features do not match API features"
@@ -198,42 +244,67 @@ def load_model():
     return bundle
 
 
-# -------------------------------------
-# APPLICATION LIFESPAN
-# -------------------------------------
+# ------------------------------------
+# Application lifecycle
+# ------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
     global MODEL_BUNDLE
+    global DATABASE_READY
 
     MODEL_BUNDLE = load_model()
 
     try:
+
+        DATABASE_READY = initialize_database()
+
+        logger.info(
+            "database_initialized"
+            if DATABASE_READY
+            else "database_not_configured"
+        )
+
+    except Exception as exc:
+
+        DATABASE_READY = False
+
+        logger.error(
+            "database_initialization_failed",
+            extra={
+                "context": {
+                    "error_type": type(exc).__name__
+                }
+            },
+        )
+
+    try:
         yield
+
     finally:
         MODEL_BUNDLE = None
+        DATABASE_READY = False
 
-
-# -------------------------------------
-# FASTAPI APPLICATION
-# -------------------------------------
 
 app = FastAPI(
     title="FraudLens AI API",
-    description="Experimental fraud prediction service",
-    version="1.0.0",
+    description=(
+        "Experimental fraud detection API "
+        "with monitoring and persistent storage"
+    ),
+    version="1.1.0",
     lifespan=lifespan,
 )
 
+app.middleware("http")(
+    request_monitoring_middleware
+)
 
-# Request monitoring middleware
-app.middleware("http")(request_monitoring_middleware)
 
-
-# -------------------------------------
-# HOME ENDPOINT
-# -------------------------------------
+# ------------------------------------
+# Basic endpoints
+# ------------------------------------
 
 @app.get("/")
 def home():
@@ -244,26 +315,43 @@ def home():
     }
 
 
-# -------------------------------------
-# HEALTH ENDPOINT
-# -------------------------------------
-
 @app.get("/health")
 def health():
 
     return {
         "status": (
-            "ready" if MODEL_BUNDLE is not None
+            "ready"
+            if MODEL_BUNDLE is not None
             else "not_ready"
         )
     }
 
 
-# -------------------------------------
-# FEATURE ENGINEERING
-# -------------------------------------
+@app.get(
+    "/database/status",
+    dependencies=[Depends(verify_api_key)],
+)
+def database_status():
 
-def prepare_features(raw_features, saved_features):
+    if not DATABASE_READY:
+        return {"status": "unavailable"}
+
+    try:
+        get_database_summary()
+    except Exception:
+        return {"status": "unavailable"}
+
+    return {"status": "ready"}
+
+
+# ------------------------------------
+# Feature engineering
+# ------------------------------------
+
+def prepare_features(
+    raw_features,
+    saved_features,
+):
 
     row = dict(raw_features)
 
@@ -272,7 +360,9 @@ def prepare_features(raw_features, saved_features):
 
     row["log_amount"] = math.log1p(amount)
 
-    row["amount_is_zero"] = int(amount == 0)
+    row["amount_is_zero"] = int(
+        amount == 0
+    )
 
     row["elapsed_day"] = int(
         elapsed_time // 86400
@@ -287,10 +377,9 @@ def prepare_features(raw_features, saved_features):
     return frame.loc[:, saved_features]
 
 
-#
-# -------------------------------------
-# FRAUD PREDICTION ENDPOINT
-# -------------------------------------
+# ------------------------------------
+# Prediction endpoint
+# ------------------------------------
 
 @app.post(
     "/predict",
@@ -313,8 +402,14 @@ def predict(
         )
 
     model = MODEL_BUNDLE["model"]
-    threshold = float(MODEL_BUNDLE["threshold"])
-    feature_names = MODEL_BUNDLE["feature_names"]
+
+    threshold = float(
+        MODEL_BUNDLE["threshold"]
+    )
+
+    feature_names = MODEL_BUNDLE[
+        "feature_names"
+    ]
 
     X = prepare_features(
         transaction.features,
@@ -361,12 +456,17 @@ def predict(
             detail="Model returned invalid probability",
         )
 
-    prediction = int(probability >= threshold)
+    prediction = int(
+        probability >= threshold
+    )
 
     label = (
-        "Fraud" if prediction == 1
+        "Fraud"
+        if prediction == 1
         else "Legitimate"
     )
+
+    # In-memory monitoring
 
     prediction_monitor.record_prediction(
         probability=probability,
@@ -375,7 +475,8 @@ def predict(
         request_id=request_id,
     )
 
-    # Prometheus model metrics
+    # Prometheus monitoring
+
     MODEL_PREDICTIONS.labels(
         label=label
     ).inc()
@@ -384,18 +485,123 @@ def predict(
         inference_latency_ms / 1000
     )
 
+    # PostgreSQL persistent storage
+
+    stored = False
+
+    if DATABASE_READY:
+
+        stored = save_prediction(
+            request_id=request_id,
+            probability=probability,
+            threshold=threshold,
+            prediction=prediction,
+            label=label,
+            model_version=MODEL_VERSION,
+            latency_ms=inference_latency_ms,
+        )
+
     return {
-        "fraud_probability": round(probability, 6),
-        "threshold": round(threshold, 4),
+        "fraud_probability": round(
+            probability, 6
+        ),
+        "threshold": round(
+            threshold, 4
+        ),
         "prediction": prediction,
         "label": label,
-        "model": "RandomForest-Optimized",
+        "model": MODEL_VERSION,
+        "request_id": request_id,
+        "stored_in_database": stored,
     }
 
 
-# -------------------------------------
-# ML MONITORING ENDPOINT
-# -------------------------------------
+# ------------------------------------
+# Historical prediction endpoints
+# ------------------------------------
+
+@app.get(
+    "/predictions/history",
+    dependencies=[Depends(verify_api_key)],
+)
+def prediction_history(
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=1000,
+    ),
+):
+
+    if not DATABASE_READY:
+        raise HTTPException(
+            status_code=503,
+            detail="Database is unavailable",
+        )
+
+    try:
+
+        records = get_prediction_history(
+            limit=limit
+        )
+
+        return {
+            "count": len(records),
+            "predictions": records,
+        }
+
+    except Exception as exc:
+
+        logger.error(
+            "history_retrieval_failed",
+            extra={
+                "context": {
+                    "error_type": type(exc).__name__
+                }
+            },
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to retrieve prediction history",
+        ) from exc
+
+
+@app.get(
+    "/predictions/summary",
+    dependencies=[Depends(verify_api_key)],
+)
+def prediction_summary():
+
+    if not DATABASE_READY:
+        raise HTTPException(
+            status_code=503,
+            detail="Database is unavailable",
+        )
+
+    try:
+
+        return get_database_summary()
+
+    except Exception as exc:
+
+        logger.error(
+            "summary_retrieval_failed",
+            extra={
+                "context": {
+                    "error_type": type(exc).__name__
+                }
+            },
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to retrieve database summary",
+        ) from exc
+
+
+# ------------------------------------
+# Monitoring endpoints
+# ------------------------------------
 
 @app.get(
     "/monitoring/predictions",
@@ -405,10 +611,6 @@ def get_prediction_metrics():
 
     return prediction_monitor.get_metrics()
 
-
-# -------------------------------------
-# PROMETHEUS METRICS ENDPOINT
-# -------------------------------------
 
 @app.get(
     "/metrics",
@@ -420,17 +622,3 @@ def prometheus_metrics():
         content=generate_latest(),
         media_type=CONTENT_TYPE_LATEST,
     )
-
-
-
-# -------------------------------------
-# ML MONITORING ENDPOINT
-# -------------------------------------
-
-@app.get(
-    "/monitoring/predictions",
-    dependencies=[Depends(verify_api_key)],
-)
-def get_prediction_metrics():
-
-    return prediction_monitor.get_metrics()
