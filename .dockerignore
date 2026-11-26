@@ -22,3 +22,6 @@ models/candidates/
 mlartifacts/
 mlflow.db-shm
 mlflow.db-wal
+
+key
+*~
