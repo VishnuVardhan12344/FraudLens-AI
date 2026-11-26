@@ -17,3 +17,8 @@ mlflow.db
 .env
 .env.*
 .streamlit/secrets.toml
+models/backups/
+models/candidates/
+mlartifacts/
+mlflow.db-shm
+mlflow.db-wal

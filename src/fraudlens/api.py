@@ -403,6 +403,18 @@ def predict(
 
     model = MODEL_BUNDLE["model"]
 
+    model_version = MODEL_VERSION
+
+    registry_version = MODEL_BUNDLE.get(
+        "registry_version"
+    )
+
+    if registry_version is not None:
+        model_version = (
+            f"{MODEL_VERSION}-v{registry_version}"
+        )
+
+
     threshold = float(
         MODEL_BUNDLE["threshold"]
     )
@@ -497,7 +509,7 @@ def predict(
             threshold=threshold,
             prediction=prediction,
             label=label,
-            model_version=MODEL_VERSION,
+            model_version=model_version,
             latency_ms=inference_latency_ms,
         )
 
@@ -510,7 +522,7 @@ def predict(
         ),
         "prediction": prediction,
         "label": label,
-        "model": MODEL_VERSION,
+        "model": model_version,
         "request_id": request_id,
         "stored_in_database": stored,
     }
@@ -622,3 +634,33 @@ def prometheus_metrics():
         content=generate_latest(),
         media_type=CONTENT_TYPE_LATEST,
     )
+
+
+@app.get(
+    "/model/info",
+    dependencies=[Depends(verify_api_key)],
+)
+def model_info():
+
+    if MODEL_BUNDLE is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Model unavailable",
+        )
+
+    return {
+        "model": MODEL_VERSION,
+        "registry_version": MODEL_BUNDLE.get(
+            "registry_version",
+            "unregistered",
+        ),
+        "threshold": float(
+            MODEL_BUNDLE["threshold"]
+        ),
+        "feature_count": len(
+            MODEL_BUNDLE["feature_names"]
+        ),
+        "deployed_at": MODEL_BUNDLE.get(
+            "deployed_at"
+        ),
+    }
