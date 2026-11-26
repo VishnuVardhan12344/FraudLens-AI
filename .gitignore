@@ -32,3 +32,6 @@ models/backups/
 mlartifacts/
 mlflow.db-shm
 mlflow.db-wal
+
+/key
+*~
